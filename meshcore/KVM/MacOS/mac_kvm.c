@@ -98,6 +98,8 @@ int KVM_SEND(char *buffer, int bufferLen)
 
 
 CGDirectDisplayID SCREEN_NUM = 0;
+volatile unsigned short g_display_sel = 0; // 0 = main display, 1..N = position in the active display list
+#define KVM_MAX_DISPLAYS 16
 int SH_HANDLE = 0;
 int SCREEN_WIDTH = 0;
 int SCREEN_HEIGHT = 0;
@@ -160,6 +162,57 @@ void senddebug(int val)
 }
 
 
+
+// N2IT: the display being shared. Falls back to the main display if the selected one was unplugged.
+static CGDirectDisplayID kvm_selected_display()
+{
+	CGDirectDisplayID displays[KVM_MAX_DISPLAYS];
+	uint32_t count = 0;
+	unsigned short sel = g_display_sel;
+
+	if (sel > 0 && CGGetActiveDisplayList(KVM_MAX_DISPLAYS, displays, &count) == kCGErrorSuccess && sel <= count) { return displays[sel - 1]; }
+	return CGMainDisplayID();
+}
+
+// N2IT: backing pixels per point, worked out per display because Retina and normal screens differ.
+static int kvm_display_scale(CGDirectDisplayID display)
+{
+	int scale = 1;
+	size_t points = CGDisplayPixelsWide(display);
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+
+	if (mode != NULL)
+	{
+		if (points > 0) { scale = (int)(CGDisplayModeGetPixelWidth(mode) / points); }
+		CGDisplayModeRelease(mode);
+	}
+	return (scale < 1) ? 1 : scale;
+}
+
+// N2IT: tell the viewer which displays exist, same message as the Windows and Linux agents.
+static void kvm_send_display_list()
+{
+	CGDirectDisplayID displays[KVM_MAX_DISPLAYS];
+	uint32_t count = 0, i;
+	unsigned short current = g_display_sel;
+	char *buffer;
+	int totalSize;
+
+	if (CGGetActiveDisplayList(KVM_MAX_DISPLAYS, displays, &count) != kCGErrorSuccess || count == 0) { return; }
+	if (current == 0 || current > count) { current = 1; } // The main display is always first in the list
+
+	totalSize = 2 /*Type*/ + 2 /*Size*/ + 2 /*Count*/ + ((int)count * 2) /*IDs*/ + 2 /*Current*/;
+	buffer = ILibMemory_SmartAllocate(totalSize);
+	((unsigned short*)buffer)[0] = (unsigned short)htons((unsigned short)MNG_KVM_GET_DISPLAYS);
+	((unsigned short*)buffer)[1] = (unsigned short)htons((unsigned short)totalSize);
+	((unsigned short*)buffer)[2] = (unsigned short)htons((unsigned short)count);
+	for (i = 0; i < count; i++) { ((unsigned short*)buffer)[i + 3] = (unsigned short)htons((unsigned short)(i + 1)); }
+	((unsigned short*)buffer)[i + 3] = (unsigned short)htons(current);
+
+	ILibQueue_Lock(g_messageQ);
+	ILibQueue_EnQueue(g_messageQ, buffer);
+	ILibQueue_UnLock(g_messageQ);
+}
 
 void kvm_send_resolution() 
 {
@@ -316,14 +369,8 @@ int kvm_init()
 	ILibCriticalLogFilename = "KVMSlave.log";
 	int old_height_count = TILE_HEIGHT_COUNT;
 	
-	SCREEN_NUM = CGMainDisplayID();
-	
-	if (SCREEN_WIDTH > 0)
-	{
-		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(SCREEN_NUM);
-		SCREEN_SCALE = (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH;
-		CGDisplayModeRelease(mode);
-	}
+	SCREEN_NUM = kvm_selected_display();
+	SCREEN_SCALE = kvm_display_scale(SCREEN_NUM);
 
 	SCREEN_HEIGHT = CGDisplayPixelsHigh(SCREEN_NUM) * SCREEN_SCALE;
 	SCREEN_WIDTH = CGDisplayPixelsWide(SCREEN_NUM) * SCREEN_SCALE;
@@ -339,6 +386,7 @@ int kvm_init()
 	if (SCREEN_HEIGHT % TILE_HEIGHT) { TILE_HEIGHT_COUNT++; }
 	
 	kvm_send_resolution();
+	kvm_send_display_list();
 	reset_tile_info(old_height_count);
 	
 	unsigned char *buffer = ILibMemory_SmartAllocate(5);
@@ -393,8 +441,10 @@ int kvm_server_inputdata(char* block, int blocklen)
 			// Same as above — process mouse locally in -kvmagent mode.
 			if (size == 10 || size == 12)
 			{
-				x = ((int)ntohs(((unsigned short*)(block))[3])) / SCREEN_SCALE;
-				y = ((int)ntohs(((unsigned short*)(block))[4])) / SCREEN_SCALE;
+				// N2IT: the viewer sends coordinates inside the shared display; macOS wants global ones.
+				CGRect bounds = CGDisplayBounds(SCREEN_NUM);
+				x = (((int)ntohs(((unsigned short*)(block))[3])) / SCREEN_SCALE) + (int)bounds.origin.x;
+				y = (((int)ntohs(((unsigned short*)(block))[4])) / SCREEN_SCALE) + (int)bounds.origin.y;
 				
 				if (size == 12) w = ((short)ntohs(((short*)(block))[5]));
 				
@@ -434,6 +484,19 @@ int kvm_server_inputdata(char* block, int blocklen)
 		{
 			if (size != 5) break;
 			g_remotepause = block[4];
+			break;
+		}
+		case MNG_KVM_GET_DISPLAYS: // N2IT: viewer asks for the display list
+		{
+			kvm_send_display_list();
+			break;
+		}
+		case MNG_KVM_SET_DISPLAY: // N2IT: the capture loop sees the new display and re-initialises
+		{
+			unsigned short sel;
+			if (size < 6) break;
+			sel = ntohs(((unsigned short*)(block))[2]);
+			g_display_sel = (sel == 65535) ? 0 : sel; // "All displays" is not offered on macOS
 			break;
 		}
 		case MNG_KVM_FRAME_RATE_TIMER:
@@ -568,7 +631,8 @@ void* kvm_server_mainloop(void* param)
 	long long tilesize = 0;
 	void *desktop = NULL;
 	void *buf = NULL;
-	int screen_height, screen_width, screen_num;
+	int screen_height, screen_width, screen_scale;
+	CGDirectDisplayID screen_num;
 	int written = 0;
 	struct sockaddr_un serveraddr;
 
@@ -707,25 +771,15 @@ void* kvm_server_mainloop(void* param)
 			}
 		}
 
-		screen_num = CGMainDisplayID();
+		screen_num = kvm_selected_display();
 
 		if (screen_num == 0) { g_shutdown = 1; senddebug(-2); break; }
 		
-		if (SCREEN_SCALE_SET == 0)
-		{
-			CGDisplayModeRef mode = CGDisplayCopyDisplayMode(screen_num);
-			if (SCREEN_WIDTH > 0 && SCREEN_SCALE < (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH)
-			{
-				SCREEN_SCALE = (int) CGDisplayModeGetPixelWidth(mode) / SCREEN_WIDTH;
-				SCREEN_SCALE_SET = 1;
-			}			 
-			CGDisplayModeRelease(mode);
-		}
+		screen_scale = kvm_display_scale(screen_num);
+		screen_height = CGDisplayPixelsHigh(screen_num) * screen_scale;
+		screen_width = CGDisplayPixelsWide(screen_num) * screen_scale;
 		
-		screen_height = CGDisplayPixelsHigh(screen_num) * SCREEN_SCALE;
-		screen_width = CGDisplayPixelsWide(screen_num) * SCREEN_SCALE;
-		
-		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num)) 
+		if ((SCREEN_HEIGHT != screen_height || (SCREEN_WIDTH != screen_width) || SCREEN_NUM != screen_num || SCREEN_SCALE != screen_scale)) 
 		{
 			kvm_init();
 			continue;

@@ -1,0 +1,29 @@
+name: N2IT Viewer agent release
+on:
+  push:
+    branches: ['n2it-macos-multi-display']
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/mac-build.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: meshagent-macos-*
+          path: out
+          merge-multiple: true
+      - name: Publish to the n2it-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd out && sha256sum meshagent_osx-* > SHA256SUMS && cat SHA256SUMS
+          gh release delete n2it-latest --yes --cleanup-tag || true
+          gh release create n2it-latest meshagent_osx-* SHA256SUMS --target "$GITHUB_SHA" --title "N2IT Viewer macOS agent" --notes "Build of ${GITHUB_SHA::7}: macOS display selection."
